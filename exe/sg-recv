@@ -1,0 +1,287 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# sg-recv -- SecureDGram CLI tool to read received (inbound) messages
+#
+# Queries the inbound_messages table and outputs results as JSON.
+# Can also query outbound message status.
+#
+# Usage:
+#   sg-recv [options]              # show recent inbound messages
+#   sg-recv --outbound [options]   # show outbound message status
+#   sg-recv --follow               # poll for new messages continuously
+
+require 'securedgram/version'
+require 'securedgram/env_loader'
+
+## Load .env:
+SecureDGram::EnvLoader.load_dotenv
+
+require 'optparse'
+require 'json'
+require 'sqlite3'
+
+## Defaults:
+db_path      = ENV.fetch('SECUREDGRAM_DB', 'securedgram.db')
+limit        = 20
+outbound     = false
+state        = nil
+from_addr    = nil
+msg_id       = nil
+follow       = false
+interval     = 1.0
+since_id     = nil
+compact      = false
+payload_only = false
+read_included = false
+no_mark      = false
+
+optparser = OptionParser.new do |opts|
+  opts.banner = "Usage: #{File.basename($0)} [options]"
+  opts.separator ""
+  opts.separator "SecureDGram v#{SecureDGram::VERSION} -- Read messages from the database."
+  opts.separator ""
+  opts.separator "Options:"
+
+  opts.on("--db PATH", "SQLite3 database path (default: from .env)") do |path|
+    db_path = path
+  end
+
+  opts.on("-n", "--limit N", Integer, "Number of messages to return (default: 20, 0 = all)") do |n|
+    limit = n
+  end
+
+  opts.on("-o", "--outbound", "Query outbound messages instead of inbound") do
+    outbound = true
+  end
+
+  opts.on("-s", "--state STATE", "Filter by message state (e.g., ack_sent, received, pending, sent, acknowledged)") do |s|
+    state = s
+  end
+
+  opts.on("--from ADDR", "Filter inbound by sender IP address") do |addr|
+    from_addr = addr
+  end
+
+  opts.on("--to ADDR", "Filter outbound by destination IP address") do |addr|
+    from_addr = addr  ## Reuse same variable; context changes meaning
+  end
+
+  opts.on("-i", "--id MESSAGE_ID", "Look up a specific message by message_id") do |mid|
+    msg_id = mid.strip.downcase
+  end
+
+  opts.on("-f", "--follow", "Continuously poll for new messages (Ctrl+C to stop)") do
+    follow = true
+  end
+
+  opts.on("--interval SECS", Float, "Poll interval in seconds for --follow mode (default: 1.0)") do |secs|
+    interval = secs
+  end
+
+  opts.on("--since-id ID", Integer, "Only show messages with row id > ID") do |id|
+    since_id = id
+  end
+
+  opts.on("-c", "--compact", "Output one JSON object per line (JSONL) instead of pretty-printed") do
+    compact = true
+  end
+
+  opts.on("-p", "--payload-only", "Output only the payload field of each message") do
+    payload_only = true
+  end
+
+  opts.on("-r", "--read-included", "Include already-read messages (default: unread only for inbound)") do
+    read_included = true
+  end
+
+  opts.on("--no-mark", "Don't increment read_count (peek without marking as read)") do
+    no_mark = true
+  end
+
+  opts.on("-V", "--version", "Show version and exit") do
+    puts "sg-recv (SecureDGram) #{SecureDGram::VERSION}"
+    exit
+  end
+
+  opts.on("-h", "--help", "Show this help") do
+    puts opts
+    exit
+  end
+end
+
+begin
+  optparser.parse!(ARGV)
+rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+  STDERR.puts "ERROR: #{e.message}"
+  STDERR.puts optparser
+  exit 1
+end
+
+## Verify database exists:
+unless File.file?(db_path)
+  STDERR.puts "ERROR: Database not found at #{db_path}"
+  STDERR.puts "Has the daemon been started at least once? (It creates the DB on first run.)"
+  exit 1
+end
+
+## Build query:
+def build_query(outbound, msg_id, state, from_addr, since_id, limit, read_included)
+  table = outbound ? "outbound_messages" : "inbound_messages"
+  conditions = []
+  params = []
+
+  if msg_id
+    conditions << "message_id = ?"
+    params << msg_id
+  end
+
+  if state
+    conditions << "state = ?"
+    params << state
+  end
+
+  if from_addr
+    if outbound
+      conditions << "dst_addr = ?"
+    else
+      conditions << "src_addr = ?"
+    end
+    params << from_addr
+  end
+
+  if since_id
+    conditions << "id > ?"
+    params << since_id
+  end
+
+  ## For inbound queries, default to unread only (read_count = 0):
+  if !outbound && !read_included && !msg_id
+    conditions << "read_count = 0"
+  end
+
+  where = conditions.empty? ? "" : " WHERE " + conditions.join(" AND ")
+  limit_clause = (limit > 0) ? " LIMIT #{limit}" : ""
+
+  query = "SELECT * FROM #{table}#{where} ORDER BY id DESC#{limit_clause}"
+  return query, params
+end
+
+## Format a row for output:
+def format_row(row, payload_only)
+  if payload_only
+    begin
+      return JSON.parse(row['payload'])
+    rescue
+      return row['payload']
+    end
+  end
+  ## Convert the Hash to a clean structure:
+  result = {}
+  row.each do |key, value|
+    next if key.is_a?(Integer)  ## Skip numeric index keys from results_as_hash
+    result[key] = value
+  end
+  ## Parse payload JSON for nested output:
+  if result['payload']
+    begin
+      result['payload'] = JSON.parse(result['payload'])
+    rescue
+      ## Leave as string if not valid JSON
+    end
+  end
+  result
+end
+
+begin
+  db = SQLite3::Database.new(db_path)
+  db.results_as_hash = true
+  db.execute("PRAGMA journal_mode = WAL")
+  db.busy_timeout = 5000
+
+  if follow
+    ## Follow mode: continuously poll for new messages
+    last_id = since_id || 0
+
+    ## Get the current max id as starting point if no since_id given:
+    if last_id == 0
+      table = outbound ? "outbound_messages" : "inbound_messages"
+      max_row = db.get_first_row("SELECT MAX(id) as max_id FROM #{table}")
+      last_id = (max_row && max_row['max_id']) ? max_row['max_id'] : 0
+      STDERR.puts "Following new messages (since id #{last_id}). Press Ctrl+C to stop."
+    end
+
+    begin
+      loop do
+        query, params = build_query(outbound, msg_id, state, from_addr, last_id, 0, read_included)
+        ## Override ORDER to ASC for follow mode:
+        query = query.sub("ORDER BY id DESC", "ORDER BY id ASC")
+        rows = db.execute(query, params)
+
+        rows.each do |row|
+          formatted = format_row(row, payload_only)
+          if compact
+            puts JSON.generate(formatted)
+          else
+            puts JSON.pretty_generate(formatted)
+          end
+          STDOUT.flush
+          last_id = row['id'] if row['id'] > last_id
+
+          ## Mark as read (increment read_count) for inbound messages:
+          if !outbound && !no_mark
+            db.execute(
+              "UPDATE inbound_messages SET read_count = read_count + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE id = ?",
+              [row['id']]
+            )
+          end
+        end
+
+        sleep interval
+      end
+    rescue Interrupt
+      STDERR.puts "\nStopped."
+    end
+
+  else
+    ## One-shot query:
+    query, params = build_query(outbound, msg_id, state, from_addr, since_id, limit, read_included)
+    rows = db.execute(query, params)
+
+    results = rows.map { |row| format_row(row, payload_only) }
+
+    ## Mark as read (increment read_count) for inbound messages:
+    if !outbound && !no_mark
+      rows.each do |row|
+        db.execute(
+          "UPDATE inbound_messages SET read_count = read_count + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now') WHERE id = ?",
+          [row['id']]
+        )
+      end
+    end
+
+    if msg_id && results.size == 1
+      ## Single lookup: output the object directly:
+      if compact
+        puts JSON.generate(results.first)
+      else
+        puts JSON.pretty_generate(results.first)
+      end
+    else
+      if compact
+        results.each { |r| puts JSON.generate(r) }
+      else
+        puts JSON.pretty_generate(results)
+      end
+    end
+  end
+
+  db.close
+
+rescue SQLite3::BusyException => e
+  STDERR.puts "ERROR: Database is busy: #{e.message}"
+  exit 1
+rescue SQLite3::Exception => e
+  STDERR.puts "ERROR: Database error: #{e.class}: #{e.message}"
+  exit 1
+end

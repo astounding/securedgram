@@ -1,0 +1,176 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# securedgram -- SecureDGram encrypted UDP messaging daemon
+#
+# Usage: securedgram [options] start|stop|restart|status|poll
+
+require 'securedgram'
+
+## Load .env (||= semantics -- ENV already set wins):
+SecureDGram::EnvLoader.load_dotenv
+
+require 'logger'
+require 'optparse'
+
+## Defaults (sane for unprivileged gem-installed usage):
+defaults = {
+  :user             => ENV.fetch('SECUREDGRAM_USER', 'nobody'),
+  :prog_name        => "securedgram",
+  :log              => nil,
+  :log_target       => ENV.fetch('SECUREDGRAM_LOG', 'syslog'),
+  :pidfile          => ENV.fetch('SECUREDGRAM_PIDFILE', 'securedgram.pid'),
+  :loglevel         => Logger::WARN,
+  :address          => ENV.fetch('SECUREDGRAM_ADDRESS', '0.0.0.0'),
+  :port             => ENV.fetch('SECUREDGRAM_PORT', '61773').to_i,
+  :secret           => [ENV.fetch('SECUREDGRAM_SECRET', '')].pack('H*'),
+  :window           => ENV.fetch('SECUREDGRAM_WINDOW', '10').to_i,
+  :max_retries      => ENV.fetch('SECUREDGRAM_MAX_RETRIES', '10').to_i,
+  :retry_interval   => ENV.fetch('SECUREDGRAM_RETRY_INTERVAL', '5').to_i,
+  :db_path          => ENV.fetch('SECUREDGRAM_DB', 'securedgram.db'),
+  :env_file         => File.join(Dir.pwd, '.env')
+}
+
+# Program name:
+prog = File.basename($0)
+
+options = defaults.dup
+optparser = OptionParser.new do |opts|
+  opts.banner = "Usage: #{prog} [options] start|stop|restart|status|poll"
+  opts.separator ""
+  opts.separator "SecureDGram v#{SecureDGram::VERSION} -- Encrypted UDP messaging daemon"
+  opts.separator ""
+  opts.separator "Options:"
+  opts.on("-v", "--verbose", "Enable INFO level logging") do
+    options[:loglevel] = Logger::INFO
+  end
+  opts.on("-d", "--debug", "Enable DEBUG level logging (very verbose)") do
+    options[:loglevel] = Logger::DEBUG
+  end
+  opts.on("-l", "--log TARGET", "Log destination: syslog, stdout, or /path/to/file (default: #{defaults[:log_target]})") do |target|
+    options[:log_target] = target
+  end
+  opts.on("-P", "--pidfile PIDFILE", "Daemon process ID file (default: #{defaults[:pidfile]})") do |pidfile|
+    options[:pidfile] = pidfile
+  end
+  opts.on("-p", "--port PORT", "UDP listen port number (default: #{defaults[:port]})") do |port|
+    options[:port] = port.to_i
+  end
+  opts.on("-b", "--bind IP", "Server bind IP address (default: #{defaults[:address]})") do |address|
+    options[:address] = address
+  end
+  opts.on("-s", "--secret HEX", "32-byte shared secret (64-char hex string)") do |secret|
+    secret = secret.strip.downcase
+    raise "Invalid secret format." unless /^[a-f0-9]{64}$/.match(secret)
+    options[:secret] = [secret].pack('H*')
+  end
+  opts.on("--db PATH", "SQLite3 database path (default: #{defaults[:db_path]})") do |path|
+    options[:db_path] = path
+  end
+  opts.on("-w", "--window SECS", Integer, "Timestamp replay window in seconds (default: #{defaults[:window]})") do |secs|
+    options[:window] = secs
+  end
+  opts.on("-r", "--max-retries N", Integer, "Max send retries before marking failed (default: #{defaults[:max_retries]})") do |n|
+    options[:max_retries] = n
+  end
+  opts.on("-u", "--user USER", "Unix user to run as after privilege drop (default: #{defaults[:user]})") do |user|
+    options[:user] = user
+  end
+  opts.on("--retry-interval SECS", Integer, "Seconds before retransmitting unACKed messages (default: #{defaults[:retry_interval]})") do |secs|
+    options[:retry_interval] = secs
+  end
+  opts.on("-V", "--version", "Show version and exit") do
+    puts "securedgram (SecureDGram) #{SecureDGram::VERSION}"
+    exit
+  end
+  opts.on("-h", "--help", "Show this help") do
+    puts opts
+    exit
+  end
+end
+begin
+  optparser.parse!(ARGV)
+rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+  STDERR.puts "ERROR: #{e.message}"
+  STDERR.puts optparser
+  exit 1
+end
+
+log = Logger.new(STDOUT)
+log.level = options[:loglevel]
+options[:log] = log
+
+if options[:port] < 1024 && Process.euid != 0
+  log.fatal "This program must be run as root to bind to privileged port #{options[:port]}."
+  exit
+end
+
+pidfile = options[:pidfile]
+log.debug "Reading PID file #{options[:pidfile].inspect}"
+pid     = SecureDGram::DaemonUtils.running_pid(pidfile, prog)
+log.debug "pid=#{pid.inspect}"
+
+cmd     = ARGV.empty? ? nil : ARGV.last
+case cmd
+when 'start'
+  if !pid.nil?
+    log.error "Another process (PID #{pid}) is running already."
+    exit
+  end
+when 'stop', 'restart'
+  log.warn "#{cmd.upcase} requested from CLI."
+  stopped = true
+  if pid.nil?
+    log.warn "No process is currently running."
+  else
+    stopped = SecureDGram::DaemonUtils.stop_daemon(pidfile, prog)
+  end
+  if cmd == 'stop'
+    exit
+  end
+
+  unless stopped
+    log.error "RESTARTING is unnecessary--another process was already started."
+    exit
+  end
+when 'status'
+  log.warn "STATUS requested from CLI."
+  if pid.nil?
+    log.warn "No process is currently running."
+  else
+    log.warn "Process #{pid} is running currently."
+  end
+  exit
+when 'poll'
+  log.warn "POLL requested from CLI."
+  pid = SecureDGram::DaemonUtils.running_pid(pidfile, prog)
+  if pid.nil?
+    log.warn "No process is currently running."
+  else
+    log.warn "Waiting for process #{pid} to terminate."
+    SecureDGram::DaemonUtils.poll_daemon(pidfile, prog)
+    log.warn "Process #{pid} appears to have terminated."
+  end
+  exit
+else
+  log.error("Invalid command. Expected 'start|stop|restart|status|poll'\n" + optparser.to_s)
+  exit 1
+end
+
+log.warn "START requested from CLI." if cmd == 'start'
+
+## Start the daemon:
+log.warn "Parent process #{Process.pid} is starting a new daemon process."
+
+# Add required options for DaemonUtils
+options[:prog_name] = prog
+
+daemon_pid = SecureDGram::DaemonUtils.daemonize(SecureDGram::UDPServer, options)
+log.warn "Daemon process #{daemon_pid} was spawned by parent process #{Process.pid}."
+
+## Write the PID file:
+begin
+  SecureDGram::DaemonUtils.write_pidfile(options[:pidfile], daemon_pid)
+rescue => e
+  log.fatal "Parent process #{Process.pid} FAILED to write daemon PID #{daemon_pid} to PID file #{options[:pidfile].inspect}: #{e.message}"
+end

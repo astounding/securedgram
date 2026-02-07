@@ -1,0 +1,178 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# sg-send -- SecureDGram CLI tool to inject outbound messages
+#
+# Inserts a message into the outbound_messages table for the daemon to
+# encrypt and send.  The daemon picks up rows with state='pending' on
+# its next polling cycle (~100ms).
+#
+# Usage:
+#   sg-send [options] <dst_addr> <dst_port> <json_payload>
+#   sg-send [options] --file <path>       # read payload from file
+#   echo '{"content":"hi"}' | sg-send [options] <dst_addr> <dst_port> -
+
+require 'securedgram/version'
+require 'securedgram/env_loader'
+
+## Load .env:
+SecureDGram::EnvLoader.load_dotenv
+
+require 'optparse'
+require 'json'
+require 'securerandom'
+require 'sqlite3'
+
+## Defaults:
+db_path      = ENV.fetch('SECUREDGRAM_DB', 'securedgram.db')
+message_id   = nil
+quiet        = false
+payload_file = nil
+
+optparser = OptionParser.new do |opts|
+  opts.banner = "Usage: #{File.basename($0)} [options] <dst_addr> <dst_port> <json_payload | - | --file PATH>"
+  opts.separator ""
+  opts.separator "SecureDGram v#{SecureDGram::VERSION} -- Inject a message into the outbound queue."
+  opts.separator "The daemon will encrypt and send it on the next poll cycle."
+  opts.separator ""
+  opts.separator "Options:"
+
+  opts.on("--db PATH", "SQLite3 database path (default: from .env or securedgram.db)") do |path|
+    db_path = path
+  end
+
+  opts.on("-m", "--message-id HEX", "Set message_id (24-char hex). If omitted, daemon generates one.") do |mid|
+    mid = mid.strip.downcase
+    unless /^[a-f0-9]{24}$/.match(mid)
+      STDERR.puts "ERROR: message_id must be a 24-character lowercase hex string."
+      exit 1
+    end
+    message_id = mid
+  end
+
+  opts.on("-f", "--file PATH", "Read JSON payload from a file instead of command line") do |path|
+    unless File.file?(path)
+      STDERR.puts "ERROR: File not found: #{path}"
+      exit 1
+    end
+    payload_file = path
+  end
+
+  opts.on("-q", "--quiet", "Suppress output on success (exit code only)") do
+    quiet = true
+  end
+
+  opts.on("-V", "--version", "Show version and exit") do
+    puts "sg-send (SecureDGram) #{SecureDGram::VERSION}"
+    exit
+  end
+
+  opts.on("-h", "--help", "Show this help") do
+    puts opts
+    exit
+  end
+end
+
+begin
+  optparser.parse!(ARGV)
+rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+  STDERR.puts "ERROR: #{e.message}"
+  STDERR.puts optparser
+  exit 1
+end
+
+## Parse positional arguments:
+if ARGV.size < 2
+  STDERR.puts "ERROR: Missing required arguments: <dst_addr> <dst_port> <json_payload | ->"
+  STDERR.puts optparser
+  exit 1
+end
+
+dst_addr = ARGV[0]
+dst_port = ARGV[1].to_i
+
+if dst_port < 1 || dst_port > 65535
+  STDERR.puts "ERROR: Invalid port number: #{ARGV[1]}"
+  exit 1
+end
+
+## Read payload:
+if payload_file
+  payload_str = File.read(payload_file)
+elsif ARGV.size >= 3
+  if ARGV[2] == '-'
+    payload_str = STDIN.read
+  else
+    payload_str = ARGV[2]
+  end
+else
+  ## Try reading from stdin if no payload arg:
+  if STDIN.tty?
+    STDERR.puts "ERROR: Missing JSON payload argument."
+    STDERR.puts optparser
+    exit 1
+  end
+  payload_str = STDIN.read
+end
+
+## Validate JSON:
+begin
+  payload_json = JSON.parse(payload_str)
+rescue JSON::ParserError => e
+  STDERR.puts "ERROR: Invalid JSON payload: #{e.message}"
+  exit 1
+end
+
+## If message_id provided, inject/validate in payload:
+if message_id
+  if payload_json.key?('message_id') && payload_json['message_id'] != message_id
+    STDERR.puts "ERROR: --message-id '#{message_id}' conflicts with payload message_id '#{payload_json['message_id']}'"
+    exit 1
+  end
+  payload_json['message_id'] = message_id
+  payload_str = payload_json.to_json
+end
+
+## Verify database exists:
+unless File.file?(db_path)
+  STDERR.puts "ERROR: Database not found at #{db_path}"
+  STDERR.puts "Has the daemon been started at least once? (It creates the DB on first run.)"
+  exit 1
+end
+
+## Insert into outbound_messages:
+begin
+  db = SQLite3::Database.new(db_path)
+  db.execute("PRAGMA journal_mode = WAL")
+  db.busy_timeout = 5000
+
+  db.execute(
+    "INSERT INTO outbound_messages (message_id, dst_addr, dst_port, payload) VALUES (?, ?, ?, ?)",
+    [message_id, dst_addr, dst_port, payload_str]
+  )
+
+  row_id = db.last_insert_row_id
+  db.close
+
+  unless quiet
+    result = {
+      status:     "queued",
+      row_id:     row_id,
+      message_id: message_id,
+      dst_addr:   dst_addr,
+      dst_port:   dst_port
+    }
+    puts JSON.pretty_generate(result)
+  end
+
+rescue SQLite3::ConstraintException => e
+  STDERR.puts "ERROR: Constraint violation (duplicate message_id?): #{e.message}"
+  exit 1
+rescue SQLite3::BusyException => e
+  STDERR.puts "ERROR: Database is busy: #{e.message}"
+  STDERR.puts "The daemon or another process is holding the lock. Try again."
+  exit 1
+rescue SQLite3::Exception => e
+  STDERR.puts "ERROR: Database error: #{e.class}: #{e.message}"
+  exit 1
+end

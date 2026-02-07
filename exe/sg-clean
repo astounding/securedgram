@@ -1,0 +1,337 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# sg-clean -- SecureDGram CLI tool to purge old messages from the database
+#
+# Deletes terminal-state messages older than the specified age.
+# By default purges:
+#   - Outbound: acknowledged, send_failed
+#   - Inbound:  ack_sent, ack_failed (only where read_count > 0)
+#
+# Usage:
+#   sg-clean <age>                      # e.g., 7d, 24h, 4w
+#   sg-clean --before <datetime>        # ISO 8601: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+#   sg-clean --dry-run 30d              # preview what would be deleted
+#
+# Age suffixes (GNU sleep / systemd convention):
+#   s = seconds, m = minutes, h = hours, d = days, w = weeks
+
+require 'securedgram/version'
+require 'securedgram/env_loader'
+
+## Load .env:
+SecureDGram::EnvLoader.load_dotenv
+
+require 'optparse'
+require 'json'
+require 'sqlite3'
+require 'time'
+
+## Duration suffix multipliers (GNU sleep / systemd convention):
+DURATION_MULTIPLIERS = {
+  's' => 1,
+  'm' => 60,
+  'h' => 3600,
+  'd' => 86400,
+  'w' => 604800,
+}.freeze
+
+##
+## Parse a duration string like "7d", "24h", "30m", "3600s", "4w"
+## Returns seconds as an integer, or nil if invalid.
+##
+def parse_duration(str)
+  str = str.strip
+  if m = /\A(\d+)([smhdw])\z/.match(str)
+    return m[1].to_i * DURATION_MULTIPLIERS[m[2]]
+  end
+  nil
+end
+
+##
+## Parse an age argument: either a duration suffix or an ISO 8601 datetime.
+## Returns a Time object representing the cutoff.
+##
+def parse_cutoff(str)
+  ## Try duration first:
+  seconds = parse_duration(str)
+  if seconds
+    return Time.now - seconds
+  end
+
+  ## Try ISO 8601 datetime (Time.parse handles YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, etc.):
+  begin
+    return Time.parse(str)
+  rescue ArgumentError
+    nil
+  end
+end
+
+## Defaults:
+db_path        = ENV.fetch('SECUREDGRAM_DB', 'securedgram.db')
+dry_run        = false
+auto_yes       = false
+no_vacuum      = false
+outbound_only  = false
+inbound_only   = false
+include_unread = false
+all_states     = false
+target_state   = nil
+before_str     = nil
+
+optparser = OptionParser.new do |opts|
+  opts.banner = "Usage: #{File.basename($0)} [options] <age>"
+  opts.separator ""
+  opts.separator "SecureDGram v#{SecureDGram::VERSION} -- Purge old messages from the database."
+  opts.separator ""
+  opts.separator "Age format: <number><suffix> where suffix is:"
+  opts.separator "  s = seconds, m = minutes, h = hours, d = days, w = weeks"
+  opts.separator "  Examples: 7d (7 days), 24h (24 hours), 4w (4 weeks), 3600s (1 hour)"
+  opts.separator ""
+  opts.separator "Options:"
+
+  opts.on("--db PATH", "SQLite3 database path (default: from .env)") do |path|
+    db_path = path
+  end
+
+  opts.on("--before DATETIME", "Purge messages before this date (ISO 8601: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)") do |dt|
+    before_str = dt
+  end
+
+  opts.on("--dry-run", "Show what would be deleted without actually deleting") do
+    dry_run = true
+  end
+
+  opts.on("-y", "--yes", "Skip confirmation prompt (for scripting)") do
+    auto_yes = true
+  end
+
+  opts.on("--no-vacuum", "Skip VACUUM after deletion") do
+    no_vacuum = true
+  end
+
+  opts.on("--outbound-only", "Only purge outbound messages") do
+    outbound_only = true
+  end
+
+  opts.on("--inbound-only", "Only purge inbound messages") do
+    inbound_only = true
+  end
+
+  opts.on("--include-unread", "Also purge inbound messages with read_count = 0") do
+    include_unread = true
+  end
+
+  opts.on("--all-states", "Purge ALL matching rows regardless of state (DANGEROUS)") do
+    all_states = true
+  end
+
+  opts.on("-s", "--state STATE", "Target a specific state only (e.g., send_failed, acknowledged)") do |s|
+    target_state = s
+  end
+
+  opts.on("-V", "--version", "Show version and exit") do
+    puts "sg-clean (SecureDGram) #{SecureDGram::VERSION}"
+    exit
+  end
+
+  opts.on("-h", "--help", "Show this help") do
+    puts opts
+    exit
+  end
+end
+
+begin
+  optparser.parse!(ARGV)
+rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+  STDERR.puts "ERROR: #{e.message}"
+  STDERR.puts optparser
+  exit 1
+end
+
+## Conflicting flags:
+if outbound_only && inbound_only
+  STDERR.puts "ERROR: --outbound-only and --inbound-only are mutually exclusive."
+  exit 1
+end
+
+## Parse cutoff time:
+cutoff = nil
+
+if before_str
+  cutoff = parse_cutoff(before_str)
+  unless cutoff
+    STDERR.puts "ERROR: Cannot parse --before value: #{before_str.inspect}"
+    STDERR.puts "Expected ISO 8601 format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS"
+    exit 1
+  end
+elsif ARGV.size >= 1
+  cutoff = parse_cutoff(ARGV[0])
+  unless cutoff
+    STDERR.puts "ERROR: Cannot parse age: #{ARGV[0].inspect}"
+    STDERR.puts "Expected format: <number><suffix> where suffix is s/m/h/d/w"
+    STDERR.puts "  Examples: 7d, 24h, 30m, 3600s, 4w"
+    STDERR.puts "Or ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS"
+    exit 1
+  end
+else
+  STDERR.puts "ERROR: Missing required age argument."
+  STDERR.puts optparser
+  exit 1
+end
+
+cutoff_str = cutoff.strftime('%Y-%m-%dT%H:%M:%S.%6N')
+
+## Verify database exists:
+unless File.file?(db_path)
+  STDERR.puts "ERROR: Database not found at #{db_path}"
+  exit 1
+end
+
+## Terminal states for each table:
+OUTBOUND_TERMINAL = ['acknowledged', 'send_failed'].freeze
+INBOUND_TERMINAL  = ['ack_sent', 'ack_failed'].freeze
+
+##
+## Build DELETE conditions for a table.
+## Returns [where_clause, params] or nil if this table should be skipped.
+##
+def build_conditions(table, cutoff_str, target_state, all_states, include_unread)
+  conditions = []
+  params = []
+
+  conditions << "updated_at < ?"
+  params << cutoff_str
+
+  ## State filter:
+  if target_state
+    conditions << "state = ?"
+    params << target_state
+  elsif !all_states
+    if table == 'outbound_messages'
+      placeholders = OUTBOUND_TERMINAL.map { '?' }.join(', ')
+      conditions << "state IN (#{placeholders})"
+      params.concat(OUTBOUND_TERMINAL)
+    else
+      placeholders = INBOUND_TERMINAL.map { '?' }.join(', ')
+      conditions << "state IN (#{placeholders})"
+      params.concat(INBOUND_TERMINAL)
+    end
+  end
+
+  ## For inbound: skip unread unless --include-unread:
+  if table == 'inbound_messages' && !include_unread && !all_states
+    conditions << "read_count > 0"
+  end
+
+  where = conditions.join(" AND ")
+  return where, params
+end
+
+begin
+  db = SQLite3::Database.new(db_path)
+  db.results_as_hash = true
+  db.execute("PRAGMA journal_mode = WAL")
+  db.busy_timeout = 5000
+
+  tables = []
+  tables << 'outbound_messages' unless inbound_only
+  tables << 'inbound_messages'  unless outbound_only
+
+  total_to_delete = 0
+  table_counts = {}
+
+  ## Count phase:
+  tables.each do |table|
+    where, params = build_conditions(table, cutoff_str, target_state, all_states, include_unread)
+    count_query = "SELECT COUNT(*) as cnt FROM #{table} WHERE #{where}"
+    row = db.get_first_row(count_query, params)
+    count = row ? row['cnt'] : 0
+    table_counts[table] = { count: count, where: where, params: params }
+    total_to_delete += count
+  end
+
+  ## Report:
+  puts "Cutoff: #{cutoff.strftime('%Y-%m-%d %H:%M:%S')} (messages last updated before this time)"
+  puts ""
+
+  tables.each do |table|
+    info = table_counts[table]
+    label = table == 'outbound_messages' ? 'Outbound' : 'Inbound'
+
+    if info[:count] > 0
+      ## Show state breakdown:
+      where = info[:where]
+      params = info[:params]
+      breakdown_query = "SELECT state, COUNT(*) as cnt FROM #{table} WHERE #{where} GROUP BY state ORDER BY cnt DESC"
+      breakdown = db.execute(breakdown_query, params)
+      puts "  #{label}: #{info[:count]} rows to delete"
+      breakdown.each do |brow|
+        puts "    #{brow['state']}: #{brow['cnt']}"
+      end
+    else
+      puts "  #{label}: 0 rows to delete"
+    end
+  end
+
+  puts ""
+
+  if total_to_delete == 0
+    puts "Nothing to delete."
+    db.close
+    exit 0
+  end
+
+  if dry_run
+    puts "(dry run — no rows were deleted)"
+    db.close
+    exit 0
+  end
+
+  ## Confirmation:
+  unless auto_yes
+    STDERR.print "Delete #{total_to_delete} rows? [y/N] "
+    STDERR.flush
+    answer = STDIN.gets
+    unless answer && answer.strip.downcase == 'y'
+      puts "Cancelled."
+      db.close
+      exit 0
+    end
+  end
+
+  ## Delete phase:
+  total_deleted = 0
+  tables.each do |table|
+    info = table_counts[table]
+    next if info[:count] == 0
+
+    delete_query = "DELETE FROM #{table} WHERE #{info[:where]}"
+    db.execute(delete_query, info[:params])
+    deleted = db.changes
+    total_deleted += deleted
+
+    label = table == 'outbound_messages' ? 'Outbound' : 'Inbound'
+    puts "  #{label}: #{deleted} rows deleted"
+  end
+
+  puts ""
+  puts "Total: #{total_deleted} rows deleted."
+
+  ## VACUUM (default unless --no-vacuum):
+  unless no_vacuum
+    puts "Running VACUUM to reclaim disk space..."
+    db.execute("VACUUM")
+    puts "VACUUM complete."
+  end
+
+  db.close
+
+rescue SQLite3::BusyException => e
+  STDERR.puts "ERROR: Database is busy: #{e.message}"
+  STDERR.puts "The daemon or another process is holding the lock. Try again."
+  exit 1
+rescue SQLite3::Exception => e
+  STDERR.puts "ERROR: Database error: #{e.class}: #{e.message}"
+  exit 1
+end

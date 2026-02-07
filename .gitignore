@@ -1,0 +1,36 @@
+# Environment secrets - NEVER commit
+.env
+
+# PID files
+*.pid
+
+# Log files
+*.log
+
+# SQLite3 database files
+*.db
+*.db-wal
+*.db-shm
+
+# var/ subdir (local test data)
+var/
+
+# Ruby gem build artifacts
+*.gem
+pkg/
+
+# Bundler
+Gemfile.lock
+.bundle/
+vendor/
+
+# Temp directories
+tmp/
+
+# macOS
+.DS_Store
+
+# IDE / editor
+.idea/
+*.swp
+*~

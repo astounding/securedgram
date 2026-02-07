@@ -1,0 +1,22 @@
+# SecureDGram Contributors
+
+## Author
+
+Aaron D. Gifford <https://aarongifford.com/>
+
+  Original design and implementation of the encrypted UDP messaging daemon,
+  DaemonUtils daemonization framework, and project architecture.
+
+## Contributors
+
+Claude Code Opus 4.6 <https://claude.ai/>
+
+  SQLite3 database integration, CLI tools (sg-send, sg-recv, sg-clean),
+  HUP signal configuration reload, read tracking, crash recovery logic,
+  syslog support, gem packaging restructure,
+  documentation (README, DESIGN, SECURITY), tests, and code review.
+
+## Copyright Holders
+
+- Aaron D. Gifford -- SecureDGram daemon and CLI tools
+- InfoWest, Inc. -- DaemonUtils module (lib/securedgram/daemon_utils.rb)
