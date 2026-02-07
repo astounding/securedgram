@@ -15,10 +15,6 @@
 # var/ subdir (local test data)
 var/
 
-# Ruby gem build artifacts
-*.gem
-pkg/
-
 # Bundler
 Gemfile.lock
 .bundle/
